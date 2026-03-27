@@ -1,0 +1,5 @@
+data/
+kubeconfig
+kubeadmin-password
+scripts/netobserv/netobserv-dittybopper.yaml
+*.out

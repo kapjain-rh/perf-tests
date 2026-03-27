@@ -1,0 +1,501 @@
+#!/usr/bin/env bash
+
+SCRIPTS_DIR=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd)
+export DEFAULT_SC=$(oc get storageclass -o=jsonpath='{.items[?(@.metadata.annotations.storageclass\.kubernetes\.io/is-default-class=="true")].metadata.name}')
+export LOKI_NS="netobserv-loki"
+export KAFKA_NS="netobserv-kafka"
+
+if [[ -z "${ARTIFACT_DIR}" ]]; then
+  ARTIFACT_DIR=/tmp
+fi
+
+deploy_netobserv() {
+  echo "====> Creating NetObserv Project (if it does not already exist)"
+  oc new-project netobserv || true
+
+  echo "====> Deploying NetObserv"
+  export NETOBSERV_CHANNEL='stable'
+  export NETOBSERV_SOURCE="netobserv-testing"
+  if [[ -z $INSTALLATION_SOURCE ]]; then
+    echo "INSTALLATION_SOURCE env variable is unset. Either it can be set to 'Official', 'Internal', 'OperatorHub', or 'Source' if you intend to use the 'deploy_netobserv' function". Default is 'Internal'
+    echo "Using 'Internal' as INSTALLATION_SOURCE"
+    deploy_downstream_catalogsource
+  elif [[ $INSTALLATION_SOURCE == "Official" ]]; then
+    echo "Using 'Official' as INSTALLATION_SOURCE"
+    NETOBSERV_SOURCE="redhat-operators"
+  elif [[ $INSTALLATION_SOURCE == "Internal" ]]; then
+    echo "Using 'Internal' as INSTALLATION_SOURCE"
+    deploy_downstream_catalogsource
+  elif [[ $INSTALLATION_SOURCE == "OperatorHub" ]]; then
+    echo "Using 'OperatorHub' as INSTALLATION_SOURCE"
+    NETOBSERV_CHANNEL="latest"
+    NETOBSERV_SOURCE="community-operators"
+  elif [[ $INSTALLATION_SOURCE == "Source" ]]; then
+    echo "Using 'Source' as INSTALLATION_SOURCE"
+    deploy_upstream_catalogsource
+    NETOBSERV_CHANNEL="latest"
+  else
+    echo "'$INSTALLATION_SOURCE' is not a valid value for INSTALLATION_SOURCE"
+    echo "Please set INSTALLATION_SOURCE env variable to either 'Official', 'Internal', 'OperatorHub', or 'Source' if you intend to use the 'deploy_netobserv' function"
+    echo "Don't forget to source 'netobserv.sh' again after doing so!"
+    return 1
+  fi
+
+  echo "====> Creating openshift-netobserv-operator namespace and OperatorGroup"
+  oc apply -f $SCRIPTS_DIR/netobserv/netobserv-ns_og.yaml
+  echo "====> Creating NetObserv subscription"
+  oc process --ignore-unknown-parameters=true -f "$SCRIPTS_DIR"/netobserv/netobserv-subscription.yaml -p NETOBSERV_CHANNEL=$NETOBSERV_CHANNEL NETOBSERV_SOURCE=$NETOBSERV_SOURCE -n default -o yaml >"$ARTIFACT_DIR"/netobserv-sub.yaml
+  oc apply -n openshift-netobserv-operator -f "$ARTIFACT_DIR"/netobserv-sub.yaml
+  sleep 60
+  timeout=0
+  # with downstream images it can take a while for mirrored images to get pulled
+  # and in large clusters it can be stuck in ImagePullError
+  # deleting the pod to force recreation helps.
+  while [ $timeout -lt 300 ]; do
+    oc get pod -l app=netobserv-operator -n openshift-netobserv-operator | grep Running && break
+    oc get pod -l app=netobserv-operator -n openshift-netobserv-operator
+    echo "====> Deleting the Operator pod "
+    oc delete pod -l app=netobserv-operator -n openshift-netobserv-operator
+    sleep 10
+    timeout=$((timeout+10))
+  done
+
+  oc wait --timeout=180s --for=condition=ready pod -l app=netobserv-operator -n openshift-netobserv-operator
+  timeout=0
+  while [ $timeout -lt 300 ]; do
+    oc get crd/flowcollectors.flows.netobserv.io && break
+    sleep 10
+    timeout=$((timeout+10))
+  done
+  # when using Internal builds, patch csv with images
+  # of same sha256 of quay.io instead registry.redhat.io
+  patch_unreleased_images
+  patch_netobserv "metrics" "true"
+}
+
+createFlowCollector() {
+  templateParams=$*
+  echo "====> Creating Flow Collector"
+  oc process --ignore-unknown-parameters=true -f "$SCRIPTS_DIR"/netobserv/flows_v1beta2_flowcollector.yaml $templateParams -n default -o yaml >"$ARTIFACT_DIR"/flowcollector.yaml
+  oc apply -f "$ARTIFACT_DIR"/flowcollector.yaml
+  waitForFlowcollectorReady
+}
+
+waitForFlowcollectorReady() {
+  echo "====> Waiting for eBPF pods to be ready"
+  timeout=30
+  while [ $timeout -lt 300 ]; do
+    oc get daemonset netobserv-ebpf-agent -n netobserv-privileged && break
+    sleep 10
+    timeout=$((timeout+10))
+  done
+  sleep 60
+  timeout=0
+  while [ $timeout -lt 3600 ]; do
+    agentsDesired=$(oc get daemonset netobserv-ebpf-agent -n netobserv-privileged -o jsonpath='{.status.desiredNumberScheduled}')
+    agentsReady=$(oc get daemonset netobserv-ebpf-agent -n netobserv-privileged -o jsonpath='{.status.numberReady}')
+    [[ $agentsDesired -eq "$agentsReady" ]] && break
+    sleep 30
+    timeout=$((timeout+30))
+    echo "====> ebpf agents are not ready after $timeout, checking again..."
+  done
+  oc wait --timeout=1200s --for=condition=ready flowcollector cluster
+}
+
+patch_netobserv() {
+  COMPONENT=$1
+  OVERRIDE_VALUE=$2
+  CSV=$(oc get csv -n openshift-netobserv-operator | grep -iE "net.*observ" | awk '{print $1}')
+  if [[ -z "$COMPONENT" || -z "$OVERRIDE_VALUE" ]]; then
+    echo "Specify COMPONENT and OVERRIDE_VALUE to be patched to an existing CSV deployed"
+    return 1
+  fi
+
+  if [[ "$COMPONENT" == "operator" ]]; then
+    oc patch csv/"$CSV" -n openshift-netobserv-operator --type=json -p="[{\"op\": \"replace\", \"path\": \"/spec/install/spec/deployments/0/spec/template/spec/containers/0/image\", \"value\": \"$OVERRIDE_VALUE\"}]"
+    return
+  fi
+
+  if [[ "$COMPONENT" == "ebpf" ]]; then
+    echo "====> Patching eBPF image"
+    OVERRIDE_VAR="RELATED_IMAGE_EBPF_AGENT"
+  elif [[ "$COMPONENT" == "flp" ]]; then
+    echo "====> Patching FLP image"
+    OVERRIDE_VAR="RELATED_IMAGE_FLOWLOGS_PIPELINE"
+  elif [[ "$COMPONENT" == "plugin" ]]; then
+    echo "====> Patching Plugin image"
+    OVERRIDE_VAR="RELATED_IMAGE_CONSOLE_PLUGIN"
+  elif [[ "$COMPONENT" == "metrics" ]]; then
+    echo "====> Patching DOWNSTREAM_DEPLOYMENT for metrics"
+    OVERRIDE_VAR="DOWNSTREAM_DEPLOYMENT"
+  else
+    echo "Use component ebpf, flp, plugin, operator, metrics as component to patch or to have metrics populated for upstream installation to cluster prometheus"
+    return 1
+  fi
+
+  ENV_INDEX=$(oc get csv/$CSV -n openshift-netobserv-operator -o json | jq --arg override_var "$OVERRIDE_VAR" '.spec.install.spec.deployments[0].spec.template.spec.containers[0].env | map(.name) | index($override_var)')
+  oc patch csv/$CSV -n openshift-netobserv-operator --type=json -p="[{\"op\": \"replace\", \"path\": \"/spec/install/spec/deployments/0/spec/template/spec/containers/0/env/${ENV_INDEX}/value\", \"value\": \"$OVERRIDE_VALUE\"}]"
+
+  if [[ $? != 0 ]]; then
+    echo "failed to patch $COMPONENT with $OVERRIDE_VALUE"
+    return 1
+  fi
+}
+
+patch_unreleased_images(){
+  if [[ $INSTALLATION_SOURCE == "Internal" ]]; then
+    QUAY_URL="quay.io/redhat-user-workloads/ocp-network-observab-tenant"
+
+    # capture stream from quay.io/redhat-user-workloads/ocp-network-observab-tenant/catalog-zstream:latest
+    STREAM=${DOWNSTREAM_IMAGE%%:*}
+    STREAM=${STREAM##*-}
+    CSV=$(oc get csv -n openshift-netobserv-operator | grep -iE "net.*observ" | awk '{print $1}')
+
+    # capture sha256 of images
+    RELATED_IMAGE_EBPF_AGENT=$(oc -n openshift-netobserv-operator get csv/$CSV -o jsonpath='{.spec.install.spec.deployments[0].spec.template.spec.containers[0].env[?(@.name=="RELATED_IMAGE_EBPF_AGENT")].value}')
+    RELATED_IMAGE_EBPF_AGENT=${RELATED_IMAGE_EBPF_AGENT#*@}
+    RELATED_IMAGE_FLOWLOGS_PIPELINE=$(oc -n openshift-netobserv-operator get csv/$CSV -o jsonpath='{.spec.install.spec.deployments[0].spec.template.spec.containers[0].env[?(@.name=="RELATED_IMAGE_FLOWLOGS_PIPELINE")].value}')
+    RELATED_IMAGE_FLOWLOGS_PIPELINE=${RELATED_IMAGE_FLOWLOGS_PIPELINE#*@}
+    RELATED_IMAGE_CONSOLE_PLUGIN=$(oc -n openshift-netobserv-operator get csv/$CSV -o jsonpath='{.spec.install.spec.deployments[0].spec.template.spec.containers[0].env[?(@.name=="RELATED_IMAGE_CONSOLE_PLUGIN")].value}')
+    RELATED_IMAGE_CONSOLE_PLUGIN=${RELATED_IMAGE_CONSOLE_PLUGIN#*@}
+    RELATED_IMAGE_OPERATOR=$(oc -n openshift-netobserv-operator get csv/$CSV -o jsonpath='{.spec.install.spec.deployments[0].spec.template.spec.containers[0].image}')
+    RELATED_IMAGE_OPERATOR=${RELATED_IMAGE_OPERATOR#*@}
+    
+    patch_netobserv "ebpf" "$QUAY_URL/netobserv-ebpf-agent-$STREAM@$RELATED_IMAGE_EBPF_AGENT"
+    patch_netobserv "flp" "$QUAY_URL/flowlogs-pipeline-$STREAM@$RELATED_IMAGE_FLOWLOGS_PIPELINE"
+    patch_netobserv "plugin" "$QUAY_URL/network-observability-console-plugin-$STREAM@$RELATED_IMAGE_CONSOLE_PLUGIN"
+    patch_netobserv "operator" "$QUAY_URL/network-observability-operator-$STREAM@$RELATED_IMAGE_OPERATOR"
+  fi
+}
+
+get_loki_channel() {
+  catalog_label=$1
+  channels=$(oc get packagemanifests -l catalog="$catalog_label" -n openshift-marketplace -o jsonpath='{.items[?(@.metadata.name=="loki-operator")].status.channels[*].name}')
+
+  # Use awk to get the last channel (most recent) - works in both bash and zsh
+  if [ -n "$channels" ]; then
+    echo "$channels" | awk '{print $NF}'
+  else
+    echo ""
+  fi
+}
+
+waitForResources(){
+  resources=$1
+  ns=$2
+  timeout=0
+  rc=1
+  while [ $timeout -lt 600 ]; do
+    status=$(oc get $resources -o jsonpath='{.status.conditions[0].type}' -n $ns)
+    if [[ $status == "Ready" ]]; then
+      rc=0
+      break
+    fi
+    sleep 30
+    timeout=$((timeout+30))
+  done
+  echo $rc
+}
+
+deploy_fallback_loki_catalogsource() {
+  echo "====> Deploying fallback CatalogSource for Loki operator with older operator index"
+
+  # Build oc process command with optional FALLBACK_CATALOG_TAG parameter
+  if [[ -n ${FALLBACK_CATALOG_TAG:-} ]]; then
+    oc process --ignore-unknown-parameters=true -f $SCRIPTS_DIR/netobserv/loki-fallback-cs.yaml -p FALLBACK_CATALOG_TAG="$FALLBACK_CATALOG_TAG" | oc apply -n openshift-marketplace -f -
+  else
+    echo "====> FALLBACK_CATALOG_TAG not set, using template default"
+    oc process --ignore-unknown-parameters=true -f $SCRIPTS_DIR/netobserv/loki-fallback-cs.yaml | oc apply -n openshift-marketplace -f -
+  fi
+
+  echo "====> Waiting for fallback CatalogSource to be ready"
+  sleep 30
+  timeout=0
+  while [ $timeout -lt 180 ]; do
+    oc wait --timeout=30s --for=condition=ready pod -l olm.catalogSource=netobserv-loki-fallback -n openshift-marketplace && break
+    sleep 10
+    timeout=$((timeout+10))
+  done
+
+  echo "====> Waiting for package manifests to be populated from fallback catalog"
+  timeout=0
+  while [ $timeout -lt 120 ]; do
+    if oc get packagemanifest loki-operator -n openshift-marketplace -o jsonpath='{.metadata.labels.catalog}' 2>/dev/null | grep -q "netobserv-loki-fallback"; then
+      echo "====> Package manifests available from fallback catalog"
+      break
+    fi
+    sleep 5
+    timeout=$((timeout+5))
+  done
+}
+
+deploy_lokistack() {
+  echo "====> Deploying LokiStack"
+
+  echo "====> Creating openshift-operators-redhat Namespace and OperatorGroup"
+  oc apply -f $SCRIPTS_DIR/loki/loki-operatorgroup.yaml
+
+  echo "====> Creating netobserv-testing CatalogSource (if applicable) and Loki Operator Subscription"
+  export LOKI_CHANNEL=''
+  export LOKI_SOURCE=''
+  if [[ $LOKI_OPERATOR == "Unreleased" ]]; then
+    deploy_downstream_catalogsource
+    LOKI_SOURCE="qe-app-registry"
+  else
+    LOKI_SOURCE="redhat-operators"
+  fi
+
+  LOKI_CHANNEL=$(get_loki_channel $LOKI_SOURCE)
+  if [ -z "${LOKI_CHANNEL}" ]; then
+    echo "====> Loki operator not found in ${LOKI_SOURCE}, attempting fallback to older operator index"
+    deploy_fallback_loki_catalogsource
+    LOKI_SOURCE="netobserv-loki-fallback"
+
+    # Retry getting channel from fallback catalog up to 3 times
+    retry_count=0
+    max_retries=3
+    while [ $retry_count -lt $max_retries ]; do
+      sleep 10
+      LOKI_CHANNEL=$(get_loki_channel $LOKI_SOURCE)
+      if [ -n "${LOKI_CHANNEL}" ]; then
+        echo "====> Successfully found Loki channel: ${LOKI_CHANNEL}"
+        break
+      fi
+      retry_count=$((retry_count+1))
+      if [ $retry_count -lt $max_retries ]; then
+        echo "====> Attempt $retry_count/$max_retries: Loki channel not found, retrying..."
+      fi
+    done
+
+    if [ -z "${LOKI_CHANNEL}" ]; then
+      echo "====> Could not determine loki-operator subscription channel even from fallback catalog after $max_retries attempts, exiting!!!!"
+      return 1
+    fi
+  fi
+
+  echo "====> Using Loki chanel ${LOKI_CHANNEL} to subscribe"
+  oc process --ignore-unknown-parameters=true -f $SCRIPTS_DIR/loki/loki-subscription.yaml -p LOKI_CHANNEL=$LOKI_CHANNEL LOKI_SOURCE=$LOKI_SOURCE -n default -o yaml >"$ARTIFACT_DIR"/loki-sub.yaml
+  oc apply -n openshift-operators-redhat -f "$ARTIFACT_DIR"/loki-sub.yaml
+
+  echo "====> Generate S3_BUCKET_NAME"
+  RAND_SUFFIX=$(tr </dev/urandom -dc 'a-z0-9' | fold -w 6 | head -n 1 || true)
+  if [[ $WORKLOAD == "None" ]] || [[ -z $WORKLOAD ]]; then
+    export S3_BUCKET_NAME="netobserv-ocpqe-$RAND_SUFFIX"
+  else
+    export S3_BUCKET_NAME="netobserv-ocpqe-$WORKLOAD-$RAND_SUFFIX"
+  fi
+
+  S3_BUCKET_NAME+="-preserve"
+  echo "====> S3_BUCKET_NAME is $S3_BUCKET_NAME"
+  echo "====> Creating $LOKI_NS Project (if it does not already exist)"
+  oc new-project $LOKI_NS || true
+  echo "====> Creating S3 secret for Loki"
+  
+  $SCRIPTS_DIR/deploy-loki-aws-secret.sh $S3_BUCKET_NAME $LOKI_NS
+  sleep 60
+  timeout=0
+  while [ $timeout -lt 300 ]; do
+    oc wait --timeout=180s --for=condition=ready pod -l app.kubernetes.io/name=loki-operator -n openshift-operators-redhat && break
+    sleep 10
+    timeout=$((timeout+30))
+  done
+
+  echo "====> Determining LokiStack config"
+  export SIZE=''
+  if [[ $LOKISTACK_SIZE == "1x.demo" ]]; then
+    SIZE="1x.demo"
+  elif [[ $LOKISTACK_SIZE == "1x.extra-small" ]]; then
+    SIZE="1x.extra-small"
+  elif [[ $LOKISTACK_SIZE == "1x.small" ]]; then
+    SIZE="1x.small"
+  elif [[ $LOKISTACK_SIZE == "1x.medium" ]]; then
+    SIZE="1x.medium"
+  else
+    echo "====> No LokiStack config was found - using '1x.extra-small'"
+    echo "====> To set config, set LOKISTACK_SIZE variable to either '1x.extra-small', '1x.small', or '1x.medium'"
+    SIZE="1x.extra-small"
+  fi
+
+  echo "====> Creating LokiStack"
+  oc process --ignore-unknown-parameters=true -f $SCRIPTS_DIR/loki/lokistack.yaml -p SIZE=$SIZE DEFAULT_SC=$DEFAULT_SC NAMESPACE=$LOKI_NS -n default -o yaml >"$ARTIFACT_DIR"/lokiStack.yaml
+  oc apply -f "$ARTIFACT_DIR"/lokiStack.yaml -n $LOKI_NS
+  sleep 30
+  echo "====> Waiting lokistack to be ready"
+  lokistackReady=$(waitForResources "lokistack/lokistack" $LOKI_NS)
+  if [ "${lokistackReady}" == 1 ]; then
+    echo "LokiStack did not become Ready after 600 secs!!!"
+    return 1
+  fi
+  echo "====> Configuring Loki rate limit alert"
+  oc apply -f $SCRIPTS_DIR/loki/loki-ratelimit-alert.yaml
+}
+
+deploy_downstream_catalogsource() {
+  echo "====> Creating ImageDigestMirrorSet"
+  oc apply -f $SCRIPTS_DIR/idms.yaml
+
+  echo "====> Determining CatalogSource config"
+  if [[ -z $DOWNSTREAM_IMAGE ]]; then
+    echo "====> No image config was found; quay.io/redhat-user-workloads/ocp-network-observab-tenant/catalog-ystream:latest as index image"
+    DOWNSTREAM_IMAGE="quay.io/redhat-user-workloads/ocp-network-observab-tenant/catalog-ystream:latest"
+  else
+    echo "====> Using image $DOWNSTREAM_IMAGE for CatalogSource"
+  fi
+
+  CatalogSource_CONFIG=$SCRIPTS_DIR/catalogsources/netobserv-cs.yaml
+  oc process -f "$CatalogSource_CONFIG" -p CATALOGSOURCE_IMAGE="$DOWNSTREAM_IMAGE" -n netobserv | oc apply -n openshift-marketplace -f -
+  echo "====> Creating netobserv-testing CatalogSource"
+  sleep 30
+  oc wait --timeout=180s --for=condition=ready pod -l olm.catalogSource=netobserv-testing -n openshift-marketplace
+}
+
+deploy_upstream_catalogsource() {
+  echo "====> Determining CatalogSource config"
+  if [[ -z $UPSTREAM_IMAGE ]]; then
+    echo "====> No image config was found - using main"
+    echo "====> To set config, set UPSTREAM_IMAGE variable to desired endpoint"
+    export UPSTREAM_IMAGE="quay.io/netobserv/network-observability-operator-catalog:v0.0.0-sha-main"
+  else
+    echo "====> Using image $UPSTREAM_IMAGE for CatalogSource"
+  fi
+
+  CatalogSource_CONFIG=$SCRIPTS_DIR/catalogsources/netobserv-cs.yaml
+  oc process -f "$CatalogSource_CONFIG" -p CATALOGSOURCE_IMAGE="$UPSTREAM_IMAGE" -n netobserv | oc apply -n openshift-marketplace -f -
+  echo "====> Creating netobserv-testing CatalogSource from the main bundle"
+  sleep 30
+  oc wait --timeout=180s --for=condition=ready pod -l olm.catalogSource=netobserv-testing -n openshift-marketplace
+}
+
+deploy_kafka() {
+  echo "====> Creating $KAFKA_NS Project (if it does not already exist)"
+  oc new-project $KAFKA_NS || true
+  echo "====> Deploying Kafka"
+  echo "====> Creating amq-streams Subscription"
+  oc apply -f $SCRIPTS_DIR/amq-streams/amq-streams-subscription.yaml
+  sleep 60
+  oc wait --timeout=180s --for=condition=ready pod -l name=amq-streams-cluster-operator -n openshift-operators
+
+  # update AMQStreams operator memory limit to 1G as current limits of 384Mi is not enough for 250 nodes scenario
+  CSV_NAME=$(oc get csv -n openshift-operators -l operators.coreos.com/amq-streams.openshift-operators= -o jsonpath='{.items[].metadata.name}')
+  oc -n openshift-operators patch csv $CSV_NAME --type=json -p "[{"op": "replace", "path": "/spec/install/spec/deployments/0/spec/template/spec/containers/0/resources/limits/memory", "value": "1Gi"}]"
+  
+  echo "====> Creating kafka-metrics ConfigMap and kafka-resources-metrics PodMonitor"
+  oc apply -f $SCRIPTS_DIR/amq-streams/metrics-config.yaml -n $KAFKA_NS
+  echo "====> Creating kafka-cluster Kafka"
+  oc process -f $SCRIPTS_DIR/amq-streams/default.yaml -n $KAFKA_NS | oc apply -n $KAFKA_NS -f -
+  echo "====> Creating kafka-pool KafkaNodePool"
+  oc process -f $SCRIPTS_DIR/amq-streams/nodePool.yaml -n $KAFKA_NS | oc apply -n $KAFKA_NS -f -
+
+  echo "====> Creating network-flows KafkaTopic"
+  if [[ -z $TOPIC_PARTITIONS ]]; then
+    echo "====> No topic partitions config was found - using 6"
+    echo "====> To set config, set TOPIC_PARTITIONS variable to desired number"
+    export TOPIC_PARTITIONS=6
+  fi
+  oc process -f $SCRIPTS_DIR/amq-streams/kafkaTopic.yaml -p TOPIC_PARTITIONS="$TOPIC_PARTITIONS" -n $KAFKA_NS | oc apply -n $KAFKA_NS -f -
+  sleep 120
+  oc wait --timeout=180s --for=condition=ready kafkatopic network-flows -n $KAFKA_NS
+}
+
+delete_s3() {
+  S3_BUCKET_NAME=$(oc get secrets/s3-secret -n $LOKI_NS -o jsonpath='{.data.bucketnames}' | base64 -d)
+  echo "====> Getting S3 Bucket Name"
+  if [[ -z $S3_BUCKET_NAME ]]; then
+    echo "====> Could not get S3 Bucket Name"
+  else
+    echo "====> Got $S3_BUCKET_NAME"
+    echo "====> Deleting AWS S3 Bucket"
+    retries=0
+    while [ $retries -lt 20 ]; do
+      aws s3 rb s3://$S3_BUCKET_NAME --force && break
+      retries=$((retries+1))
+    done
+    if [[ $retries -lt 20 ]]; then
+      echo "====> AWS S3 Bucket $S3_BUCKET_NAME deleted"
+    else
+      echo "====> AWS S3 Bucket $S3_BUCKET_NAME is NOT deleted after 20 attempts, please delete manually!!!"
+      return 1
+    fi
+  fi
+}
+
+delete_lokistack() {
+  echo "====> Deleting LokiStack"
+  oc delete --ignore-not-found lokistack/lokistack -n $LOKI_NS || true
+}
+
+
+delete_kafka() {
+  echo "====> Deleting Kafka"
+  oc delete --ignore-not-found kafkaTopic/network-flows -n $KAFKA_NS || true
+  oc delete --ignore-not-found kafkaNodePool/kafka-pool -n $KAFKA_NS || true
+  oc delete --ignore-not-found kafka/kafka-cluster -n $KAFKA_NS || true
+  oc delete --ignore-not-found -f $SCRIPTS_DIR/amq-streams/amq-streams-subscription.yaml || true
+  oc delete --ignore-not-found csv -l operators.coreos.com/amq-streams.openshift-operators -n openshift-operators || true
+  oc delete --ignore-not-found project $KAFKA_NS || true
+}
+
+delete_flowcollector() {
+  echo "====> Deleting Flow Collector"
+  # note 'cluster' is the default Flow Collector name, but that may not always be the case
+  oc delete --ignore-not-found flowcollector/cluster || true
+}
+
+delete_netobserv_operator() {
+  echo "====> Deleting all NetObserv resources"
+  oc delete --ignore-not-found sub/netobserv-operator -n openshift-netobserv-operator || true
+  oc delete --ignore-not-found csv -l operators.coreos.com/netobserv-operator.openshift-netobserv-operator= -n openshift-netobserv-operator || true
+  oc delete --ignore-not-found crd/flowcollectors.flows.netobserv.io || true
+  oc delete --ignore-not-found -f $SCRIPTS_DIR/netobserv/netobserv-ns_og.yaml || true
+  echo "====> Deleting netobserv-testing CatalogSource"
+  oc delete --ignore-not-found catalogsource/netobserv-testing -n openshift-marketplace || true
+}
+
+delete_loki_operator() {
+  echo "====> Deleting Loki Operator Subscription and CSV"
+  oc delete --ignore-not-found sub/loki-operator -n openshift-operators-redhat || true
+  oc delete --ignore-not-found csv -l operators.coreos.com/loki-operator.openshift-operators-redhat -n openshift-operators-redhat || true
+  echo "====> Deleting fallback Loki CatalogSource (if exists)"
+  oc delete --ignore-not-found catalogsource/netobserv-loki-fallback -n openshift-marketplace || true
+}
+
+get_deployment_model() {
+  local deployment_model=""
+  if oc get flowcollector cluster &>/dev/null; then
+    deployment_model=$(oc get flowcollector cluster -o jsonpath='{.spec.deploymentModel}' 2>/dev/null || echo "")
+  fi
+  if [[ -z "$deployment_model" ]]; then
+    echo "ERROR: FlowCollector not found or deployment model could not be determined" >&2
+    return 1
+  fi
+  echo "$deployment_model"
+}
+
+is_loki_enabled() {
+  local loki_enabled=""
+  if oc get flowcollector cluster &>/dev/null; then
+    loki_enabled=$(oc get flowcollector cluster -o jsonpath='{.spec.loki.enable}' 2>/dev/null || echo "")
+  fi
+  if [[ -z "$loki_enabled" ]]; then
+    echo "ERROR: FlowCollector not found or loki.enable could not be determined" >&2
+    return 1
+  fi
+  echo "$loki_enabled"
+}
+
+nukeobserv() {
+  echo "====> Nuking NetObserv and all related resources"
+  if [[ $(get_deployment_model 2>/dev/null) == "Kafka" ]]; then
+    delete_kafka
+  fi
+  if [[ $(is_loki_enabled 2>/dev/null) == "true" ]]; then
+    delete_lokistack
+    delete_loki_operator
+    delete_s3
+    oc delete --ignore-not-found project $LOKI_NS || true
+  fi
+  delete_flowcollector
+  delete_netobserv_operator
+  # seperate step as multiple different operators use this namespace
+  oc delete project netobserv  || true
+}

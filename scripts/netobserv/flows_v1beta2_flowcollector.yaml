@@ -1,0 +1,66 @@
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: flowcollector-template
+objects:
+  - apiVersion: flows.netobserv.io/v1beta2
+    kind: FlowCollector
+    metadata:
+      name: cluster
+    spec:
+      namespace: netobserv
+      deploymentModel: "${DeploymentModel}"
+      agent:
+        type: eBPF
+        ebpf:
+          sampling: ${{EBPFSamplingRate}}
+          privileged: "${{EBPFPrivileged}}"
+          resources:
+            limits:
+              memory: ${EBPFMemoryLimit}
+          features: "${{EBPFeatures}}"
+          flowFilter:
+            action: Accept
+            cidr: 0.0.0.0/0
+            enable: true
+      processor:
+        resources:
+          limits:
+            memory: ${FLPMemoryLimit}
+        consumerReplicas: ${{KafkaConsumerReplicas}}
+      kafka:
+        address: kafka-cluster-kafka-bootstrap.${KafkaNS}
+        topic: network-flows
+        tls:
+          enable: false
+      loki:
+        mode: LokiStack
+        enable: "${{LokiEnable}}"
+        lokiStack:
+          name: lokistack
+          namespace: ${{LokiNS}}
+      networkPolicy:
+        enable: true
+        additionalNamespaces: 
+          - ${{KafkaNS}}
+parameters:
+  - name: DeploymentModel
+    value: "Kafka"
+  - name: EBPFSamplingRate
+    value: "1"
+  - name: EBPFMemoryLimit
+    value: "800Mi"
+  - name: EBPFPrivileged
+    value: "true"
+  - name: EBPFeatures
+    value: '["PacketDrop","DNSTracking","FlowRTT","NetworkEvents","PacketTranslation","UDNMapping","IPSec"]'
+  - name: FLPMemoryLimit
+    value: "800Mi"
+  - name: KafkaConsumerReplicas
+    value: "3"
+  - name: LokiEnable
+    value: "true"
+  - name: LokiNS
+    value: netobserv-loki
+  - name: KafkaNS
+    value: netobserv-kafka
