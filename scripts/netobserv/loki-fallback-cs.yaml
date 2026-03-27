@@ -1,0 +1,24 @@
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: loki-fallback-catalogsource-template
+objects:
+  - apiVersion: operators.coreos.com/v1alpha1
+    kind: CatalogSource
+    metadata:
+      name: ${NAME}
+      namespace: ${NAMESPACE}
+    spec:
+      sourceType: grpc
+      image: registry.redhat.io/redhat/redhat-operator-index:v${FALLBACK_CATALOG_TAG}
+      displayName: Loki Fallback Operators
+      updateStrategy:
+        registryPoll:
+          interval: 30m
+parameters:
+  - name: FALLBACK_CATALOG_TAG
+    value: "4.21"
+  - name: NAMESPACE
+    value: "openshift-marketplace"
+  - name: NAME
+    value: "netobserv-loki-fallback"

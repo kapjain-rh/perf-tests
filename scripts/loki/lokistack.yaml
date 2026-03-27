@@ -1,0 +1,159 @@
+apiVersion: template.openshift.io/v1
+kind: Template
+metadata:
+  name: lokistack-template
+objects:
+  - apiVersion: loki.grafana.com/v1
+    kind: LokiStack
+    metadata:
+      name: lokistack
+      namespace: ${NAMESPACE}
+    spec:
+      limits:
+        global:
+          ingestion:
+            ingestionBurstSize: 100
+            ingestionRate: 500
+            maxGlobalStreamsPerTenant: 100000
+            perStreamRateLimit: 9
+            perStreamRateLimitBurst: 45
+      tenants:
+        mode: openshift-network
+      template:
+        compactor:
+          nodeAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                preference:
+                  matchExpressions:
+                    - key: node-role.kubernetes.io/infra
+                      operator: Exists
+          tolerations:
+            - key: node-role.kubernetes.io/infra
+              value: reserved
+              effect: NoSchedule
+            - key: node-role.kubernetes.io/infra
+              value: reserved
+              effect: NoExecute
+        distributor:
+          nodeAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                preference:
+                  matchExpressions:
+                    - key: node-role.kubernetes.io/infra
+                      operator: Exists
+          tolerations:
+            - key: node-role.kubernetes.io/infra
+              value: reserved
+              effect: NoSchedule
+            - key: node-role.kubernetes.io/infra
+              value: reserved
+              effect: NoExecute
+        ingester:
+          nodeAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                preference:
+                  matchExpressions:
+                    - key: node-role.kubernetes.io/infra
+                      operator: Exists
+          tolerations:
+            - key: node-role.kubernetes.io/infra
+              value: reserved
+              effect: NoSchedule
+            - key: node-role.kubernetes.io/infra
+              value: reserved
+              effect: NoExecute
+        querier:
+          nodeAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                preference:
+                  matchExpressions:
+                    - key: node-role.kubernetes.io/infra
+                      operator: Exists
+          tolerations:
+            - key: node-role.kubernetes.io/infra
+              value: reserved
+              effect: NoSchedule
+            - key: node-role.kubernetes.io/infra
+              value: reserved
+              effect: NoExecute
+        queryFrontend:
+          nodeAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                preference:
+                  matchExpressions:
+                    - key: node-role.kubernetes.io/infra
+                      operator: Exists
+          tolerations:
+            - key: node-role.kubernetes.io/infra
+              value: reserved
+              effect: NoSchedule
+            - key: node-role.kubernetes.io/infra
+              value: reserved
+              effect: NoExecute
+        gateway:
+          nodeAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                preference:
+                  matchExpressions:
+                    - key: node-role.kubernetes.io/infra
+                      operator: Exists
+          tolerations:
+            - key: node-role.kubernetes.io/infra
+              value: reserved
+              effect: NoSchedule
+            - key: node-role.kubernetes.io/infra
+              value: reserved
+              effect: NoExecute
+        indexGateway:
+          nodeAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                preference:
+                  matchExpressions:
+                    - key: node-role.kubernetes.io/infra
+                      operator: Exists
+          tolerations:
+            - key: node-role.kubernetes.io/infra
+              value: reserved
+              effect: NoSchedule
+            - key: node-role.kubernetes.io/infra
+              value: reserved
+              effect: NoExecute
+        ruler:
+          nodeAffinity:
+            preferredDuringSchedulingIgnoredDuringExecution:
+              - weight: 100
+                preference:
+                  matchExpressions:
+                    - key: node-role.kubernetes.io/infra
+                      operator: Exists
+          tolerations:
+            - key: node-role.kubernetes.io/infra
+              value: reserved
+              effect: NoSchedule
+            - key: node-role.kubernetes.io/infra
+              value: reserved
+              effect: NoExecute
+      managementState: Managed
+      storage:
+        schemas:
+          - effectiveDate: '2023-10-15'
+            version: v13
+        secret:
+          name: s3-secret
+          type: s3
+      size: ${SIZE}
+      storageClassName: ${DEFAULT_SC}
+parameters:
+  - name: NAMESPACE
+    value: netobserv-loki
+  - name: SIZE
+    value: "1x.extra-small"
+  - name: DEFAULT_SC
+    value: "gp3-csi"

@@ -1,0 +1,32 @@
+---
+ack:
+  - uuid: 58a57780-480e-481f-b31d-582fdcc853fc
+    metric: TotalNetObservRSSUsage_avg
+    reason: NETOBSERV-2439
+  - uuid:  58a57780-480e-481f-b31d-582fdcc853fc
+    metric: NetObservClusterMemPercentUtil_avg
+    reason: NETOBSERV-2439
+  - uuid: dd28a89d-9335-4f7e-9d05-6b066b3a558c
+    metric: rssOperatorTotals_avg
+    reason: NETOBSERV-2531
+  - uuid: dc022783-49b2-42a0-8d21-e24f281b343d
+    metric: NetObservClusterMemPercentUtil_avg
+    reason: CD-v2 https://redhat-internal.slack.com/archives/C02939DP5L5/p1769410391939729
+  - uuid: 3adea5e5-e3e3-403b-979a-be7a8dd7a0b7
+    metric: rssFLPTotals_avg
+    reason: Bug NETOBSERV-2597 for NDH
+  - uuid: 15e45d52-4bb6-4c01-9f3e-65ae57ff818f
+    metric: nFlowsProcessedTotals_max
+    reason: NETOBSERV-2606 Positive impact because of cacheActiveTimeout increment
+  - uuid: 15e45d52-4bb6-4c01-9f3e-65ae57ff818f
+    metric: nFlowsProcessedPerMinuteTotals_max
+    reason: NETOBSERV-2606 Positive impact because of cacheActiveTimeout increment
+  - uuid: 15e45d52-4bb6-4c01-9f3e-65ae57ff818f
+    metric: nWorkloadFlowsProcessedTotals_max
+    reason: NETOBSERV-2606 Positive impact because of cacheActiveTimeout increment
+  - uuid: 15e45d52-4bb6-4c01-9f3e-65ae57ff818f
+    metric: lokiRecordsWritten_max
+    reason: NETOBSERV-2606 Positive impact because of cacheActiveTimeout increment
+  - uuid: 15e45d52-4bb6-4c01-9f3e-65ae57ff818f
+    metric: rssEBPFTotals_avg
+    reason: Bug NETOBSERV-2597 for NDH
