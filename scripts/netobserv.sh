@@ -202,12 +202,12 @@ deploy_fallback_loki_catalogsource() {
 
   # Build oc process command with optional FALLBACK_CATALOG_TAG parameter
   if [[ -n ${FALLBACK_CATALOG_TAG:-} ]]; then
-    oc process --ignore-unknown-parameters=true -f $SCRIPTS_DIR/netobserv/loki-fallback-cs.yaml -p FALLBACK_CATALOG_TAG="$FALLBACK_CATALOG_TAG" | oc apply -n openshift-marketplace -f -
+    oc process --ignore-unknown-parameters=true -f $SCRIPTS_DIR/netobserv/loki-fallback-cs.yaml -p FALLBACK_CATALOG_TAG="$FALLBACK_CATALOG_TAG" -n default -o yaml >"$ARTIFACT_DIR"/loki-fallback-cs.yaml
   else
     echo "====> FALLBACK_CATALOG_TAG not set, using template default"
-    oc process --ignore-unknown-parameters=true -f $SCRIPTS_DIR/netobserv/loki-fallback-cs.yaml | oc apply -n openshift-marketplace -f -
+    oc process --ignore-unknown-parameters=true -f $SCRIPTS_DIR/netobserv/loki-fallback-cs.yaml -n default -o yaml >"$ARTIFACT_DIR"/loki-fallback-cs.yaml
   fi
-
+  oc apply -n openshift-marketplace -f "$ARTIFACT_DIR"/loki-fallback-cs.yaml
   echo "====> Waiting for fallback CatalogSource to be ready"
   sleep 30
   timeout=0
