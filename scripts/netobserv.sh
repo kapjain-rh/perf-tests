@@ -68,7 +68,12 @@ deploy_netobserv() {
     timeout=$((timeout+10))
   done
   
-  oc wait --timeout=180s --for=condition=ready pod -l app=netobserv-plugin-static -n openshift-netobserv-operator || return 1
+  timeout=0
+  while [ $timeout -lt 300 ]; do
+    oc get pod -l app=netobserv-plugin-static -n openshift-netobserv-operator | grep Running && break
+    sleep 10
+    timeout=$((timeout+10))
+  done
   # when using Internal builds, patch csv with images
   # of same sha256 of quay.io instead registry.redhat.io
   patch_unreleased_images
