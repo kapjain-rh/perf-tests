@@ -26,7 +26,14 @@ waitForPodReady() {
 
     readyStatuses=$(oc get pod -l "$label" -n "$namespace" -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null)
     totalPods=$(echo "$podList" | wc -w)
-    readyPods=$(echo "$readyStatuses" | grep -c "^True$" || echo 0)
+    readyPods=$(printf '%s\n' "$readyStatuses" | grep -c '^True$') || {
+      grep_status=$?
+      if (( grep_status != 1 )); then
+        echo "Failed to count Ready pods" >&2
+        return 1
+      fi
+      readyPods=0
+    }
 
     if [[ $totalPods -gt 0 && $totalPods -eq $readyPods ]]; then
       return 0
@@ -178,7 +185,14 @@ waitForFlowcollectorReady() {
 
     readyStatuses=$(oc get pod -n netobserv -o jsonpath='{range .items[*]}{.status.conditions[?(@.type=="Ready")].status}{"\n"}{end}' 2>/dev/null)
     totalPods=$(echo "$podList" | wc -w)
-    readyPods=$(echo "$readyStatuses" | grep -c "^True$" || echo 0)
+    readyPods=$(printf '%s\n' "$readyStatuses" | grep -c '^True$') || {
+      grep_status=$?
+      if (( grep_status != 1 )); then
+        echo "Failed to count Ready pods in netobserv namespace" >&2
+        return 1
+      fi
+      readyPods=0
+    }
 
     if [[ $totalPods -gt 0 && $totalPods -eq $readyPods ]]; then
       break
